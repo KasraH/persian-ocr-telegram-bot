@@ -78,6 +78,8 @@ async def extract_text_with_retry(image_or_prompt, prompt="Extract and transcrib
     attempts = 0
     model = create_gemini_model()
     max_attempts = 3 * len(MODELS)  # Try each model up to 3 times
+    timeout_count = 0
+    max_timeouts = 2  # Maximum timeout retries per model
 
     while attempts < max_attempts:
         try:
@@ -89,10 +91,29 @@ async def extract_text_with_retry(image_or_prompt, prompt="Extract and transcrib
             # Log model usage
             logger.info(f"Model usage: {MODEL_USAGE}")
 
-            # Make the API call - Important: generate_content is not a coroutine in the library,
-            # so we don't use 'await' here
-            response = model.generate_content([prompt, image_or_prompt])
-            return response
+            # Set a timeout for the operation using asyncio
+            try:
+                # Make the API call - create a future and wrap it with timeout
+                response_future = asyncio.create_task(
+                    asyncio.to_thread(model.generate_content, [
+                                      prompt, image_or_prompt])
+                )
+                # 30-second timeout
+                response = await asyncio.wait_for(response_future, timeout=30)
+                return response
+            except asyncio.TimeoutError:
+                timeout_count += 1
+                logger.warning(
+                    f"Timeout when calling {current_model} (timeout {timeout_count}/{max_timeouts})")
+
+                if timeout_count >= max_timeouts:
+                    # Too many timeouts with this model, try the next one
+                    model = await rotate_model_on_error()
+                    timeout_count = 0
+
+                # Retry with some backoff
+                await asyncio.sleep(2 * timeout_count)
+                continue
 
         except Exception as e:
             error_msg = str(e)
@@ -108,6 +129,7 @@ async def extract_text_with_retry(image_or_prompt, prompt="Extract and transcrib
 
                 # Rotate to the next model
                 model = await rotate_model_on_error()
+                timeout_count = 0  # Reset timeout counter for new model
             else:
                 # For non-rate limit errors, log and re-raise
                 logger.error(f"API error (not rate limit): {error_msg}")
