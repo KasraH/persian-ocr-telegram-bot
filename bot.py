@@ -305,8 +305,8 @@ async def process_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
         await update.message.reply_text(f"Found {page_count} pages. Processing...")
 
-        # Process up to the first 3 pages to avoid exceeding limits
-        max_pages = min(page_count, 3)
+        # Process up to the first 5 pages
+        max_pages = min(page_count, 5)
         for page_num in range(max_pages):
             await update.message.reply_text(f"Processing page {page_num + 1}/{max_pages}...")
 
