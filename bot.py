@@ -34,17 +34,21 @@ AUTHORIZED_USERS_STR = os.getenv("AUTHORIZED_USERS", "")
 AUTHORIZED_USERS = [int(user_id)
                     for user_id in AUTHORIZED_USERS_STR.split(",") if user_id]
 
-# Updated Gemini models list - using newer models
-MODELS = ["gemini-2.0-flash", "gemini-2.0-flash-lite"]  # Models in priority order
-MODEL_USAGE = {model: {"count": 0, "last_used": 0, "errors": 0} for model in MODELS}
+# Updated Gemini models list - using only 2.0 models since 1.5 will be discontinued
+# Models in priority order
+MODELS = ["gemini-2.0-flash", "gemini-2.0-flash-lite"]
+MODEL_USAGE = {model: {"count": 0, "last_used": 0, "errors": 0}
+               for model in MODELS}
 current_model_idx = 0
 
 # Configure Gemini API
 genai.configure(api_key=GOOGLE_API_KEY)
 
+
 def get_current_model():
     """Get the current model based on the model index."""
     return MODELS[current_model_idx]
+
 
 def create_gemini_model():
     """Create and return a Gemini model with the current configuration."""
@@ -52,68 +56,75 @@ def create_gemini_model():
     logger.info(f"Using model: {model_name}")
     return genai.GenerativeModel(model_name)
 
+
 async def rotate_model_on_error():
     """Rotate to the next available model on error."""
     global current_model_idx
     # Record the error for the current model
     current_model = get_current_model()
     MODEL_USAGE[current_model]["errors"] += 1
-    
+
     # Move to the next model
     current_model_idx = (current_model_idx + 1) % len(MODELS)
     logger.warning(f"Rate limit hit. Rotating to model: {get_current_model()}")
-    
+
     # Add a small delay before trying the next model
     await asyncio.sleep(2)
     return create_gemini_model()
+
 
 async def extract_text_with_retry(image_or_prompt, prompt="Extract and transcribe any Persian text in this image. Return ONLY the Persian text, no explanations."):
     """Extract text using the current Gemini model with auto-rotation on rate limits."""
     attempts = 0
     model = create_gemini_model()
     max_attempts = 3 * len(MODELS)  # Try each model up to 3 times
-    
+
     while attempts < max_attempts:
         try:
             # Track usage for the current model
             current_model = get_current_model()
             MODEL_USAGE[current_model]["count"] += 1
             MODEL_USAGE[current_model]["last_used"] = time.time()
-            
+
             # Log model usage
             logger.info(f"Model usage: {MODEL_USAGE}")
-            
+
             # Make the API call
             response = await model.generate_content([prompt, image_or_prompt])
             return response
-            
+
         except Exception as e:
             error_msg = str(e)
             attempts += 1
-            
+
             # Handle rate limit errors
             if "429" in error_msg or "quota" in error_msg:
                 if attempts >= max_attempts:
-                    logger.error(f"All models exhausted after {attempts} attempts. Error: {error_msg}")
-                    raise Exception("All models exhausted. Please try again later.")
-                
+                    logger.error(
+                        f"All models exhausted after {attempts} attempts. Error: {error_msg}")
+                    raise Exception(
+                        "All models exhausted. Please try again later.")
+
                 # Rotate to the next model
                 model = await rotate_model_on_error()
             else:
                 # For non-rate limit errors, log and re-raise
                 logger.error(f"API error (not rate limit): {error_msg}")
                 raise
-    
+
     raise Exception(f"Failed after {attempts} attempts across all models.")
 
 # Use this function instead of direct Gemini calls
+
+
 async def gemini_extract_text(image_or_prompt):
     """Wrapper for extract_text_with_retry for OCR tasks."""
     response = await extract_text_with_retry(
-        image_or_prompt, 
+        image_or_prompt,
         "Extract and transcribe any Persian text in this image. Return ONLY the Persian text, no explanations."
     )
     return response
+
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Send a welcome message when the command /start is issued."""
