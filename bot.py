@@ -1,6 +1,8 @@
 import logging
 import os
 import tempfile
+import asyncio
+import time
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters, CallbackQueryHandler
 import smtplib
@@ -32,11 +34,86 @@ AUTHORIZED_USERS_STR = os.getenv("AUTHORIZED_USERS", "")
 AUTHORIZED_USERS = [int(user_id)
                     for user_id in AUTHORIZED_USERS_STR.split(",") if user_id]
 
+# Updated Gemini models list - using newer models
+MODELS = ["gemini-2.0-flash", "gemini-2.0-flash-lite"]  # Models in priority order
+MODEL_USAGE = {model: {"count": 0, "last_used": 0, "errors": 0} for model in MODELS}
+current_model_idx = 0
+
 # Configure Gemini API
 genai.configure(api_key=GOOGLE_API_KEY)
-gemini_model = genai.GenerativeModel(
-    'gemini-1.5-pro')  # Best model for Persian OCR
 
+def get_current_model():
+    """Get the current model based on the model index."""
+    return MODELS[current_model_idx]
+
+def create_gemini_model():
+    """Create and return a Gemini model with the current configuration."""
+    model_name = get_current_model()
+    logger.info(f"Using model: {model_name}")
+    return genai.GenerativeModel(model_name)
+
+async def rotate_model_on_error():
+    """Rotate to the next available model on error."""
+    global current_model_idx
+    # Record the error for the current model
+    current_model = get_current_model()
+    MODEL_USAGE[current_model]["errors"] += 1
+    
+    # Move to the next model
+    current_model_idx = (current_model_idx + 1) % len(MODELS)
+    logger.warning(f"Rate limit hit. Rotating to model: {get_current_model()}")
+    
+    # Add a small delay before trying the next model
+    await asyncio.sleep(2)
+    return create_gemini_model()
+
+async def extract_text_with_retry(image_or_prompt, prompt="Extract and transcribe any Persian text in this image. Return ONLY the Persian text, no explanations."):
+    """Extract text using the current Gemini model with auto-rotation on rate limits."""
+    attempts = 0
+    model = create_gemini_model()
+    max_attempts = 3 * len(MODELS)  # Try each model up to 3 times
+    
+    while attempts < max_attempts:
+        try:
+            # Track usage for the current model
+            current_model = get_current_model()
+            MODEL_USAGE[current_model]["count"] += 1
+            MODEL_USAGE[current_model]["last_used"] = time.time()
+            
+            # Log model usage
+            logger.info(f"Model usage: {MODEL_USAGE}")
+            
+            # Make the API call
+            response = await model.generate_content([prompt, image_or_prompt])
+            return response
+            
+        except Exception as e:
+            error_msg = str(e)
+            attempts += 1
+            
+            # Handle rate limit errors
+            if "429" in error_msg or "quota" in error_msg:
+                if attempts >= max_attempts:
+                    logger.error(f"All models exhausted after {attempts} attempts. Error: {error_msg}")
+                    raise Exception("All models exhausted. Please try again later.")
+                
+                # Rotate to the next model
+                model = await rotate_model_on_error()
+            else:
+                # For non-rate limit errors, log and re-raise
+                logger.error(f"API error (not rate limit): {error_msg}")
+                raise
+    
+    raise Exception(f"Failed after {attempts} attempts across all models.")
+
+# Use this function instead of direct Gemini calls
+async def gemini_extract_text(image_or_prompt):
+    """Wrapper for extract_text_with_retry for OCR tasks."""
+    response = await extract_text_with_retry(
+        image_or_prompt, 
+        "Extract and transcribe any Persian text in this image. Return ONLY the Persian text, no explanations."
+    )
+    return response
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Send a welcome message when the command /start is issued."""
@@ -137,14 +214,15 @@ async def process_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         # Convert to PIL Image
         image = Image.open(io.BytesIO(photo_data))
 
-        # Extract text using Gemini Pro
-        await update.message.reply_text("Extracting Persian text with Gemini...")
-        response = gemini_model.generate_content([
-            "Extract and transcribe any Persian text in this image. Return ONLY the Persian text, no explanations.",
-            image
-        ])
-
-        extracted_text = response.text
+        # Extract text using Gemini with retry and model rotation
+        await update.message.reply_text(f"Extracting Persian text with Gemini {get_current_model()}...")
+        try:
+            response = await extract_text_with_retry(image)
+            extracted_text = response.text
+        except Exception as e:
+            await update.message.reply_text(f"⚠️ API Error: {str(e)}")
+            await update.message.reply_text("Try again in a few minutes or contact the administrator.")
+            return
 
         # Send the extracted text
         await update.message.reply_text("✅ Extracted Persian Text:")
@@ -173,6 +251,8 @@ async def process_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     except Exception as e:
         logger.error(f"Error processing image: {str(e)}")
         await update.message.reply_text(f"Error processing image: {str(e)}")
+        if "429" in str(e):
+            await update.message.reply_text("⚠️ Rate limit exceeded. Please try again later.")
 
     # Delete processing message
     await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=processing_message.message_id)
@@ -214,8 +294,8 @@ async def process_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
         await update.message.reply_text(f"Found {page_count} pages. Processing...")
 
-        # Process up to the first 5 pages to avoid exceeding limits
-        max_pages = min(page_count, 5)
+        # Process up to the first 3 pages to avoid exceeding limits
+        max_pages = min(page_count, 3)
         for page_num in range(max_pages):
             await update.message.reply_text(f"Processing page {page_num + 1}/{max_pages}...")
 
@@ -228,13 +308,19 @@ async def process_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             img_data = pix.tobytes("png")
             image = Image.open(io.BytesIO(img_data))
 
-            # Extract text using Gemini Pro
-            response = gemini_model.generate_content([
-                "Extract and transcribe any Persian text in this image. Return ONLY the Persian text, no explanations.",
-                image
-            ])
+            # Add delay between pages to avoid rate limiting
+            if page_num > 0:
+                await update.message.reply_text("Waiting a moment to avoid rate limits...")
+                await asyncio.sleep(3)  # Wait 3 seconds between pages
 
-            page_text = response.text.strip()
+            # Extract text using Gemini with retry and model rotation
+            try:
+                response = await extract_text_with_retry(image)
+                page_text = response.text.strip()
+            except Exception as e:
+                await update.message.reply_text(f"⚠️ API Error on page {page_num + 1}: {str(e)}")
+                all_text += f"\n--- Page {page_num + 1}: Error processing - {str(e)} ---\n"
+                continue
 
             # Add page text to total text
             if page_text:
@@ -290,6 +376,8 @@ async def process_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     except Exception as e:
         logger.error(f"Error processing PDF: {str(e)}")
         await update.message.reply_text(f"Error processing PDF: {str(e)}")
+        if "429" in str(e):
+            await update.message.reply_text("⚠️ Rate limit exceeded. Please try again later.")
 
     # Delete processing message
     await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=processing_message.message_id)
