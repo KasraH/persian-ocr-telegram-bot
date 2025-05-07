@@ -42,12 +42,14 @@ USER_EMAIL=recipient_email
 ### Local Development
 
 1. Clone the repository:
+
    ```bash
    git clone https://github.com/yourusername/persian-ocr-telegram-bot.git
    cd persian-ocr-telegram-bot
    ```
 
 2. Install dependencies:
+
    ```bash
    pip install -r requirements.txt
    ```
@@ -70,11 +72,3 @@ USER_EMAIL=recipient_email
 2. Bot processes the content using Google Gemini 2.0 models
 3. Extracted Persian text is returned to the user
 4. User can choose to email the result
-
-## License
-
-MIT
-
-## Contributions
-
-Contributions, issues, and feature requests are welcome!
