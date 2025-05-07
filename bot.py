@@ -89,8 +89,9 @@ async def extract_text_with_retry(image_or_prompt, prompt="Extract and transcrib
             # Log model usage
             logger.info(f"Model usage: {MODEL_USAGE}")
 
-            # Make the API call
-            response = await model.generate_content([prompt, image_or_prompt])
+            # Make the API call - Important: generate_content is not a coroutine in the library,
+            # so we don't use 'await' here
+            response = model.generate_content([prompt, image_or_prompt])
             return response
 
         except Exception as e:
